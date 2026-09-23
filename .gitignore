@@ -3,3 +3,12 @@ __pycache__/
 .pytest_cache/
 data/
 *.partial.*
+node_modules/
+.next/
+out/
+.vercel/
+.env.local
+.env*.local
+*.tsbuildinfo
+.vercel
+.env*
