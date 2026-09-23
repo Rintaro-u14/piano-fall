@@ -24,6 +24,7 @@ ALLOWED_GOOGLE_EMAIL=u14.rin.y@gmail.com
 このリポジトリはVercelプロジェクト `piano-fall` に接続されています。Clerk Marketplace連携でキーを管理し、次の環境変数をDevelopment / Preview / Productionに設定します。
 
 - `ALLOWED_GOOGLE_EMAIL`
+- `ALLOWED_GOOGLE_EMAILS` (追加で許可するアドレス。複数はカンマ区切り)
 - `NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in`
 - `NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-in`
 - `NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL=/`
