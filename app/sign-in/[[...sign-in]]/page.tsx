@@ -1,22 +1,21 @@
 "use client";
 
-import { useSignIn } from "@clerk/nextjs";
+import { useSignIn } from "@clerk/nextjs/legacy";
 import { useState } from "react";
 
 function GoogleOnlySignIn() {
-  const { fetchStatus, signIn } = useSignIn();
+  const { isLoaded, signIn } = useSignIn();
   const [error, setError] = useState("");
 
   async function continueWithGoogle() {
-    if (fetchStatus === "fetching") return;
+    if (!isLoaded) return;
     setError("");
     try {
-      const result = await signIn.sso({
+      await signIn.authenticateWithRedirect({
         strategy: "oauth_google",
         redirectUrl: "/sign-in/sso-callback",
-        redirectCallbackUrl: "/sign-in/sso-callback",
+        redirectUrlComplete: "/",
       });
-      if (result.error) setError(result.error.message);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Googleログインを開始できませんでした。");
     }
@@ -28,7 +27,7 @@ function GoogleOnlySignIn() {
       <p className="eyebrow">PIANO FALL</p>
       <h1>音を、眺めよう。</h1>
       <p>登録されたGoogleアカウントでログインしてください。</p>
-      <button className="primary-button full google-button" disabled={fetchStatus === "fetching"} onClick={() => void continueWithGoogle()}>G&nbsp;&nbsp; Googleで続ける</button>
+      <button className="primary-button full google-button" disabled={!isLoaded} onClick={() => void continueWithGoogle()}>G&nbsp;&nbsp; Googleで続ける</button>
       {error && <p className="auth-error">{error}</p>}
       <small className="auth-note">このアプリはGoogleログインのみを使用します。</small>
     </div>
