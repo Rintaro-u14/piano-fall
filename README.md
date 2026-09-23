@@ -29,7 +29,7 @@ ALLOWED_GOOGLE_EMAIL=u14.rin.y@gmail.com
 - `NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL=/`
 - `NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL=/`
 
-ClerkのSocial ConnectionsではGoogleだけを有効にしてください。Production instanceでGoogle OAuthを使う場合は、Clerk Dashboardの指示に従ってGoogle CloudのOAuthクライアント情報を設定します。
+ClerkのSocial ConnectionsではGoogleだけを有効にしてください。現在のVercel標準ドメインではClerkの開発インスタンスを使っています。ClerkのProduction instanceへ切り替える場合は、独自ドメインのDNSを設定し、Clerk Dashboardの指示に従ってGoogle CloudのOAuthクライアント情報を設定します。
 
 ```bash
 npx vercel --prod
