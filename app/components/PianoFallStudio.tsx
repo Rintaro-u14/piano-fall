@@ -11,7 +11,7 @@ type Settings = { background: string; colorMode: "track" | "channel"; colors: Re
 type MidiSearchResult = { source: string; name: string; pageUrl: string; importUrl?: string };
 
 const palette = ["#77e4c8", "#ac9bff", "#ffbd78", "#78baff", "#f18bb5", "#e5db84", "#86d78a", "#f08d85"];
-const defaults: Settings = { background: "#10191e", colorMode: "track", colors: {}, trackVolumes: {}, keyboardHeight: .22, fallSeconds: 3.5, minPitch: 21, maxPitch: 108, speed: 1, showScore: true, showChords: true, scoreMeasures: 4, masterVolume: 1 };
+const defaults: Settings = { background: "#10191e", colorMode: "track", colors: {}, trackVolumes: {}, keyboardHeight: .22, fallSeconds: 3.5, minPitch: 21, maxPitch: 108, speed: 1, showScore: true, showChords: true, scoreMeasures: 4, masterVolume: 2 };
 
 function formatTime(value: number) {
   return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, "0")}`;
