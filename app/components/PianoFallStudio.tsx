@@ -155,7 +155,7 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
     const start = context.currentTime + Math.max(0, delay);
     const length = Math.min(8, Math.max(.08, (note.end - note.start) / stateRef.current.settings.speed));
     const gain = context.createGain();
-    const peak = Math.max(.015, Math.min(.18, note.velocity * .0017));
+    const peak = Math.max(.04, Math.min(.5, note.velocity * .5));
     gain.gain.setValueAtTime(.0001, start);
     gain.gain.exponentialRampToValueAtTime(peak, start + .012);
     gain.gain.exponentialRampToValueAtTime(.0001, start + length);
