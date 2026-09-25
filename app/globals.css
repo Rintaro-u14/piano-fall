@@ -68,7 +68,8 @@ h2 { margin-bottom: 0; font-size: 15px; letter-spacing: .04em; }
 .track-panel, .settings-section { background: rgba(16, 28, 34, .8); border: 1px solid var(--line); border-radius: 13px; padding: 18px; margin-top: 14px; }
 .section-head { margin-bottom: 14px; }
 .track-count { color: var(--muted); font-size: 10px; letter-spacing: .13em; }
-.track-list { display: grid; gap: 8px; }
+.track-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 290px), 1fr)); gap: 8px; }
+.track-list > .empty { grid-column: 1 / -1; }
 .track-row { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 11px 10px; background: var(--panel-2); border-radius: 9px; }
 .track-color { width: 8px; height: 8px; border-radius: 50%; }
 .track-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
@@ -76,6 +77,8 @@ h2 { margin-bottom: 0; font-size: 15px; letter-spacing: .04em; }
 .track-row label, .setting-line { color: var(--muted); font-size: 11px; gap: 6px; }
 .track-controls { display: flex; align-items: center; gap: 12px; }
 .track-controls label { display: flex; align-items: center; white-space: nowrap; }
+.track-instrument { grid-column: 2 / -1; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.track-instrument select { flex: 1; min-width: 0; max-width: 100%; }
 .track-volume { grid-column: 2 / -1; display: grid; gap: 2px; }
 .track-volume > span { display: flex; justify-content: space-between; align-items: center; }
 .track-volume output { color: var(--text); font-variant-numeric: tabular-nums; }

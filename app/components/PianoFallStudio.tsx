@@ -2,16 +2,54 @@
 
 import { UserButton } from "@clerk/nextjs";
 import { Midi } from "@tonejs/midi";
+import { SampleLoader, Soundfont, getSoundfontNames } from "smplr";
 import { useEffect, useRef, useState } from "react";
+import { drumLane, guitarPositions, GUITAR_STRING_LABELS, resolveScoreFormat, type GuitarPosition, type ScoreFormat } from "./scoreNotation";
 
 type Note = { id: string; start: number; end: number; pitch: number; velocity: number; track: number; channel: number };
-type Track = { id: number; name: string; channel: number; program: number; count: number; drums: boolean };
+type Track = { id: number; name: string; channel: number; program: number; soundfont: string; count: number; drums: boolean };
 type Song = { name: string; duration: number; notes: Note[]; tracks: Track[]; tempos: { time: number; bpm: number }[]; signatures: { time: number; numerator: number; denominator: number }[]; beats: { time: number; strong: boolean }[] };
-type Settings = { background: string; colorMode: "track" | "channel"; colors: Record<string, string>; trackVolumes: Record<string, number>; keyboardHeight: number; fallSeconds: number; minPitch: number; maxPitch: number; speed: number; showScore: boolean; showChords: boolean; scoreMeasures: number; masterVolume: number };
+type Settings = { background: string; colorMode: "track" | "channel"; colors: Record<string, string>; trackVolumes: Record<string, number>; trackInstruments: Record<string, string>; keyboardHeight: number; fallSeconds: number; minPitch: number; maxPitch: number; speed: number; showScore: boolean; showChords: boolean; scoreMeasures: number; scoreTrack: number | null; scoreFormat: ScoreFormat; masterVolume: number };
 type MidiSearchResult = { source: string; name: string; pageUrl: string; importUrl?: string };
+type SoundfontPlayer = ReturnType<typeof Soundfont>;
 
 const palette = ["#77e4c8", "#ac9bff", "#ffbd78", "#78baff", "#f18bb5", "#e5db84", "#86d78a", "#f08d85"];
-const defaults: Settings = { background: "#10191e", colorMode: "track", colors: {}, trackVolumes: {}, keyboardHeight: .22, fallSeconds: 3.5, minPitch: 21, maxPitch: 108, speed: 1, showScore: true, showChords: true, scoreMeasures: 4, masterVolume: 2 };
+const soundfontNames = getSoundfontNames();
+const soundfontNameSet = new Set(soundfontNames);
+const programAliases: Record<string, string> = {
+  "honky-tonk piano": "honkytonk_piano", clavi: "clavinet", "synthstrings 1": "synth_strings_1", "synthstrings 2": "synth_strings_2",
+  "synth voice": "synth_choir", "synthbrass 1": "synth_brass_1", "synthbrass 2": "synth_brass_2", "lead 8 (bass + lead)": "lead_8_bass__lead",
+  "fx 8 (sci-fi)": "fx_8_scifi", "bag pipe": "bagpipe",
+};
+const defaults: Settings = { background: "#10191e", colorMode: "track", colors: {}, trackVolumes: {}, trackInstruments: {}, keyboardHeight: .22, fallSeconds: 3.5, minPitch: 21, maxPitch: 108, speed: 1, showScore: true, showChords: true, scoreMeasures: 4, scoreTrack: null, scoreFormat: "auto", masterVolume: 2 };
+const tabCache = new WeakMap<Song, Map<number, Map<string, GuitarPosition>>>();
+
+function selectedScoreTrack(song: Song, settings: Settings): Track | undefined {
+  return song.tracks.find((track) => track.id === settings.scoreTrack)
+    ?? song.tracks.find((track) => !track.drums && track.count > 0)
+    ?? song.tracks.find((track) => track.count > 0);
+}
+
+function tabForTrack(song: Song, trackId: number): Map<string, GuitarPosition> {
+  let tracks = tabCache.get(song);
+  if (!tracks) { tracks = new Map(); tabCache.set(song, tracks); }
+  let positions = tracks.get(trackId);
+  if (!positions) {
+    positions = guitarPositions(song.notes.filter((note) => note.track === trackId));
+    tracks.set(trackId, positions);
+  }
+  return positions;
+}
+
+function getSoundfontName(programName: string) {
+  const key = programName.toLowerCase().trim();
+  const normalized = programAliases[key] || key.replace(/[()]/g, "").replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  return soundfontNameSet.has(normalized) ? normalized : "acoustic_grand_piano";
+}
+
+function formatSoundfontName(name: string) {
+  return name.replace(/_+/g, " ").replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
+}
 
 function formatTime(value: number) {
   return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, "0")}`;
@@ -27,6 +65,7 @@ function parseMidi(buffer: ArrayBuffer, name: string): Song {
     name: track.name || `Track ${index + 1}`,
     channel: track.channel ?? 0,
     program: track.instrument?.number ?? 0,
+    soundfont: getSoundfontName(track.instrument?.name ?? "acoustic grand piano"),
     count: track.notes.length,
     drums: track.channel === 9,
   }));
@@ -72,7 +111,14 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
   const voicesRef = useRef(new Set<OscillatorNode>());
   const audioContextRef = useRef<AudioContext | null>(null);
   const masterGainRef = useRef<GainNode | null>(null);
+  const speakerGainRef = useRef<GainNode | null>(null);
   const trackGainRefs = useRef(new Map<number, GainNode>());
+  const soundfontPlayersRef = useRef(new Map<string, SoundfontPlayer>());
+  const soundfontLoadsRef = useRef(new Map<string, Promise<SoundfontPlayer>>());
+  const soundfontFailuresRef = useRef(new Set<string>());
+  const soundfontGenerationRef = useRef(0);
+  const soundfontLoaderRef = useRef<ReturnType<typeof SampleLoader> | null>(null);
+  const audioLoadingRef = useRef(false);
   const recordDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const [song, setSong] = useState<Song | null>(null);
   const [settings, setSettings] = useState<Settings>(defaults);
@@ -89,6 +135,8 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
   const [midiSearchStatus, setMidiSearchStatus] = useState("曲名・アーティスト名を入力してください。");
   const [midiSearching, setMidiSearching] = useState(false);
   const [midiImporting, setMidiImporting] = useState<string | null>(null);
+  const [audioLoading, setAudioLoading] = useState(false);
+  const [loadingTrackInstrument, setLoadingTrackInstrument] = useState<number | null>(null);
   const midiSearchVersion = useRef(0);
 
   useEffect(() => {
@@ -98,6 +146,7 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
       trackGainRefs.current.forEach((gain, trackId) => {
         gain.gain.setTargetAtTime(settings.trackVolumes[String(trackId)] ?? 1, context.currentTime, .015);
       });
+      speakerGainRef.current?.gain.setTargetAtTime(muted ? 0 : 1, context.currentTime, .015);
     }
     try { localStorage.setItem("pianofall.settings", JSON.stringify(settings)); } catch { /* private browsing */ }
   }, [song, settings, playing, muted, hiddenTracks, exporting]);
@@ -105,7 +154,7 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem("pianofall.settings") || "null");
-      if (saved) setSettings({ ...defaults, ...saved, colors: saved.colors || {}, trackVolumes: saved.trackVolumes || {} });
+      if (saved) setSettings({ ...defaults, ...saved, colors: saved.colors || {}, trackVolumes: saved.trackVolumes || {}, trackInstruments: saved.trackInstruments || {}, scoreTrack: null, scoreFormat: ["auto", "staff", "tab", "drums"].includes(saved.scoreFormat) ? saved.scoreFormat : "auto" });
     } catch { /* malformed local settings */ }
   }, []);
 
@@ -119,9 +168,13 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
       const context = new AudioContext({ latencyHint: "interactive" });
       const master = context.createGain();
       master.gain.value = settings.masterVolume;
-      master.connect(context.destination);
+      // Mute only silences the speakers; recordings tap the master bus directly.
+      const speaker = context.createGain();
+      speaker.gain.value = stateRef.current.muted ? 0 : 1;
+      master.connect(speaker).connect(context.destination);
       audioContextRef.current = context;
       masterGainRef.current = master;
+      speakerGainRef.current = speaker;
     }
     if (audioContextRef.current.state === "suspended") void audioContextRef.current.resume();
     return audioContextRef.current;
@@ -141,19 +194,107 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
     return gain;
   }
 
+  function soundfontKey(trackId: number, instrument: string) {
+    return `${soundfontGenerationRef.current}:${trackId}:${instrument}`;
+  }
+
+  function loadTrackSoundfont(trackId: number, instrument: string): Promise<SoundfontPlayer> {
+    const key = soundfontKey(trackId, instrument);
+    const cached = soundfontPlayersRef.current.get(key);
+    if (cached) return Promise.resolve(cached);
+    const pending = soundfontLoadsRef.current.get(key);
+    if (pending) return pending;
+
+    const context = ensureAudio();
+    const destination = trackGain(trackId) ?? masterGainRef.current ?? context.destination;
+    soundfontLoaderRef.current ??= SampleLoader(context);
+    const generation = soundfontGenerationRef.current;
+    const player = Soundfont(context, { instrument, kit: "FluidR3_GM", destination, loader: soundfontLoaderRef.current, volume: 110 });
+    const load = player.ready.then(() => {
+      if (generation !== soundfontGenerationRef.current) {
+        player.dispose();
+        throw new Error("別のMIDIに切り替わりました。");
+      }
+      soundfontPlayersRef.current.set(key, player);
+      soundfontFailuresRef.current.delete(key);
+      return player;
+    }).catch((error) => {
+      player.dispose();
+      throw error;
+    }).finally(() => soundfontLoadsRef.current.delete(key));
+    soundfontLoadsRef.current.set(key, load);
+    return load;
+  }
+
+  function clearTrackSoundfonts() {
+    soundfontGenerationRef.current += 1;
+    soundfontPlayersRef.current.forEach((player) => player.dispose());
+    soundfontPlayersRef.current.clear();
+    soundfontLoadsRef.current.clear();
+    soundfontFailuresRef.current.clear();
+  }
+
+  function selectedSoundfont(trackId: number, targetSong = stateRef.current.song, targetSettings = stateRef.current.settings) {
+    const track = targetSong?.tracks[trackId];
+    return targetSettings.trackInstruments[String(trackId)] || track?.soundfont || "acoustic_grand_piano";
+  }
+
+  async function prepareSongSoundfonts(targetSong: Song, targetSettings: Settings) {
+    const tracks = [...new Set(targetSong.notes.map((note) => note.track))];
+    const generation = soundfontGenerationRef.current;
+    let failures = 0;
+    for (let index = 0; index < tracks.length; index += 3) {
+      if (generation !== soundfontGenerationRef.current) return failures;
+      await Promise.all(tracks.slice(index, index + 3).map(async (trackId) => {
+        const instrument = selectedSoundfont(trackId, targetSong, targetSettings);
+        const key = soundfontKey(trackId, instrument);
+        try {
+          await loadTrackSoundfont(trackId, instrument);
+          soundfontFailuresRef.current.delete(key);
+        } catch {
+          soundfontFailuresRef.current.add(key);
+          failures += 1;
+        }
+      }));
+    }
+    return failures;
+  }
+
+  async function changeTrackSoundfont(trackId: number, instrument: string) {
+    if (instrument === selectedSoundfont(trackId, song, settings) || loadingTrackInstrument !== null) return;
+    setLoadingTrackInstrument(trackId);
+    try {
+      const context = ensureAudio();
+      await context.resume();
+      await loadTrackSoundfont(trackId, instrument);
+      setSettings((current) => ({ ...current, trackInstruments: { ...current.trackInstruments, [String(trackId)]: instrument } }));
+      showNotice(`${formatSoundfontName(instrument)} を読み込みました。`);
+    } catch {
+      showNotice("音源を読み込めませんでした。通信を確認して再度お試しください。", true);
+    } finally {
+      setLoadingTrackInstrument(null);
+    }
+  }
+
   function stopVoices() {
     voicesRef.current.forEach((voice) => { try { voice.stop(); voice.disconnect(); } catch { /* already stopped */ } });
     voicesRef.current.clear();
+    soundfontPlayersRef.current.forEach((player) => player.stop());
   }
 
   function playNote(note: Note, delay: number) {
     const context = audioContextRef.current;
     if (!context || !masterGainRef.current) return;
-    if (stateRef.current.muted || stateRef.current.hiddenTracks.has(note.track)) return;
     const destination = trackGain(note.track);
     if (!destination) return;
     const start = context.currentTime + Math.max(0, delay);
     const length = Math.min(8, Math.max(.08, (note.end - note.start) / stateRef.current.settings.speed));
+    const instrument = selectedSoundfont(note.track);
+    const player = soundfontPlayersRef.current.get(soundfontKey(note.track, instrument));
+    if (player) {
+      player.start({ note: note.pitch, velocity: Math.round(note.velocity * 127), time: start, duration: length });
+      return;
+    }
     const gain = context.createGain();
     const peak = Math.max(.04, Math.min(.5, note.velocity * .5));
     gain.gain.setValueAtTime(.0001, start);
@@ -194,18 +335,33 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
     return Math.min(stateRef.current.song?.duration ?? 0, startPositionRef.current + (performance.now() - playStartedRef.current) / 1000 * stateRef.current.settings.speed);
   }
 
-  function togglePlayback() {
+  async function togglePlayback() {
     if (!song) return;
     if (playing) {
       const next = currentPosition();
       positionRef.current = next; setPosition(next); setPlaying(false); stopVoices();
       return;
     }
-    ensureAudio();
-    scheduledRef.current.clear();
-    startPositionRef.current = positionRef.current;
-    playStartedRef.current = performance.now();
-    setPlaying(true);
+    if (audioLoadingRef.current) return;
+    audioLoadingRef.current = true;
+    setAudioLoading(true);
+    try {
+      const context = ensureAudio();
+      const generation = soundfontGenerationRef.current;
+      await context.resume();
+      const failures = await prepareSongSoundfonts(song, settings);
+      if (generation !== soundfontGenerationRef.current || stateRef.current.song !== song) return;
+      if (failures) showNotice(`${failures}トラックの音源を読み込めず、簡易音源で再生します。`, true);
+      scheduledRef.current.clear();
+      startPositionRef.current = positionRef.current;
+      playStartedRef.current = performance.now();
+      setPlaying(true);
+    } catch {
+      showNotice("音源の準備に失敗しました。ネット接続を確認してください。", true);
+    } finally {
+      audioLoadingRef.current = false;
+      setAudioLoading(false);
+    }
   }
 
   function seek(next: number) {
@@ -221,7 +377,7 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
       scheduleAudio();
       const next = currentPosition();
       positionRef.current = next;
-      if (next >= (stateRef.current.song?.duration ?? 0)) { setPlaying(false); stopVoices(); setPosition(0); positionRef.current = 0; scheduledRef.current.clear(); }
+      if (next >= (stateRef.current.song?.duration ?? 0)) { const end = stateRef.current.busy ? next : 0; setPlaying(false); stopVoices(); setPosition(end); positionRef.current = end; scheduledRef.current.clear(); }
     }, 55);
     return () => window.clearInterval(timer);
   }, []);
@@ -245,8 +401,8 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
     if (!file.name.match(/\.(mid|midi)$/i)) { showNotice(".mid または .midi ファイルを選んでください。", true); return false; }
     try {
       const nextSong = parseMidi(await file.arrayBuffer(), file.name);
-      stopVoices(); scheduledRef.current.clear(); positionRef.current = 0; setPosition(0); setPlaying(false);
-      setHiddenTracks(new Set()); setSong(nextSong); updateSettings({ trackVolumes: {} });
+      stopVoices(); clearTrackSoundfonts(); scheduledRef.current.clear(); positionRef.current = 0; setPosition(0); setPlaying(false);
+      setHiddenTracks(new Set()); setSong(nextSong); updateSettings({ trackVolumes: {}, trackInstruments: {}, scoreTrack: null, scoreFormat: "auto" });
       trackGainRefs.current.forEach((gain) => gain.disconnect()); trackGainRefs.current.clear();
       showNotice(`${nextSong.name} を読み込みました。`);
       return true;
@@ -371,35 +527,63 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
   }
 
   async function handleExport() {
-    if (!song || exporting) return;
+    if (!song || exporting || audioLoadingRef.current) return;
+    audioLoadingRef.current = true;
+    setAudioLoading(true);
     try {
       const context = ensureAudio();
+      const generation = soundfontGenerationRef.current;
       const canvas = canvasRef.current;
       if (!canvas || !canvas.captureStream) throw new Error("このブラウザは動画保存に対応していません。");
+      await context.resume();
+      const failures = await prepareSongSoundfonts(song, settings);
+      if (generation !== soundfontGenerationRef.current || stateRef.current.song !== song) return;
+      if (failures) showNotice(`${failures}トラックの音源を読み込めず、簡易音源で書き出します。`, true);
+      audioLoadingRef.current = false;
+      setAudioLoading(false);
       setExporting(true); setPlaying(false); stopVoices(); scheduledRef.current.clear(); seek(0);
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      await new Promise<void>((resolve) => { requestAnimationFrame(() => resolve()); window.setTimeout(resolve, 100); });
       const fps = 30;
       const canvasStream = canvas.captureStream(fps);
       const destination = context.createMediaStreamDestination();
       recordDestinationRef.current = destination;
       masterGainRef.current?.connect(destination);
-      const stream = new MediaStream([...canvasStream.getVideoTracks(), ...destination.stream.getAudioTracks()]);
-      const mimeType = MediaRecorder.isTypeSupported("video/mp4;codecs=avc1.42E01E,mp4a.40.2") ? "video/mp4;codecs=avc1.42E01E,mp4a.40.2" : "video/webm;codecs=vp9,opus";
-      const recorder = new MediaRecorder(stream, { mimeType });
-      const chunks: Blob[] = [];
-      recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
-      const stopped = new Promise<void>((resolve) => { recorder.onstop = () => resolve(); });
-      recorder.start(250);
-      startPositionRef.current = 0; playStartedRef.current = performance.now(); scheduledRef.current.clear(); setPlaying(true);
-      await new Promise((resolve) => window.setTimeout(resolve, (song.duration / settings.speed + .7) * 1000));
-      setPlaying(false); stopVoices(); recorder.stop(); await stopped;
-      const extension = mimeType.startsWith("video/mp4") ? "mp4" : "webm";
-      const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob(chunks, { type: mimeType })); link.download = `${song.name || "piano-fall"}.${extension}`; link.click();
-      window.setTimeout(() => URL.revokeObjectURL(link.href), 1000);
-      masterGainRef.current?.disconnect(destination); recordDestinationRef.current = null;
-      showNotice(`${extension.toUpperCase()}を書き出しました。`);
+      // requestAnimationFrame stops in background tabs, so keep drawing frames from a timer while hidden.
+      const backgroundDraw = window.setInterval(() => {
+        if (document.hidden) drawCanvas(canvas, stateRef.current.song, stateRef.current.settings, currentPosition(), stateRef.current.hiddenTracks);
+      }, 1000 / fps);
+      try {
+        const stream = new MediaStream([...canvasStream.getVideoTracks(), ...destination.stream.getAudioTracks()]);
+        const mimeType = pickRecorderMimeType();
+        const recorder = new MediaRecorder(stream, mimeType ? { mimeType, videoBitsPerSecond: 8_000_000 } : { videoBitsPerSecond: 8_000_000 });
+        const chunks: Blob[] = [];
+        let recorderError: unknown = null;
+        recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+        recorder.onerror = (event) => { recorderError = (event as Event & { error?: unknown }).error ?? event; };
+        const stopped = new Promise<void>((resolve) => { recorder.onstop = () => resolve(); });
+        recorder.start(1000);
+        startPositionRef.current = 0; playStartedRef.current = performance.now(); scheduledRef.current.clear(); setPlaying(true);
+        await Promise.race([new Promise((resolve) => window.setTimeout(resolve, (song.duration / settings.speed + .7) * 1000)), stopped]);
+        setPlaying(false); stopVoices();
+        if (recorder.state !== "inactive") recorder.stop();
+        await stopped;
+        const type = recorder.mimeType || mimeType || "video/webm";
+        const blob = new Blob(chunks, { type });
+        if (recorderError || !blob.size) throw new Error(`動画のエンコードに失敗しました${recorderError instanceof Error ? `（${recorderError.message}）` : ""}。別のブラウザ（Chrome / Edge 最新版）でお試しください。`);
+        const extension = type.startsWith("video/mp4") ? "mp4" : "webm";
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = `${(song.name || "piano-fall").replace(/[\\/:*?"<>|]+/g, "_")}.${extension}`;
+        document.body.appendChild(link); link.click(); link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(link.href), 60_000);
+        showNotice(`${extension.toUpperCase()}を書き出しました。`);
+      } finally {
+        window.clearInterval(backgroundDraw);
+        canvasStream.getTracks().forEach((track) => track.stop());
+        masterGainRef.current?.disconnect(destination); recordDestinationRef.current = null;
+      }
     } catch (error) { showNotice(error instanceof Error ? error.message : "動画を書き出せませんでした。", true); }
-    finally { setExporting(false); setPlaying(false); }
+    finally { audioLoadingRef.current = false; setAudioLoading(false); setExporting(false); setPlaying(false); }
   }
 
   function updateSettings(change: Partial<Settings>) { setSettings((current) => ({ ...current, ...change })); }
@@ -408,12 +592,13 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
 
   const activeTempo = song ? [...song.tempos].reverse().find((tempo) => tempo.time <= position) ?? song.tempos[0] : null;
   const activeSignature = song ? [...song.signatures].reverse().find((signature) => signature.time <= position) ?? song.signatures[0] : null;
+  const scoreTrack = song ? selectedScoreTrack(song, settings) : undefined;
 
   return (
     <>
       <header className="topbar">
         <a className="brand" href="/"><span className="brand-icon">▥</span>PIANO FALL <span className="edition">BROWSER STUDIO</span></a>
-        <div className="top-actions"><button className="outline-button" onClick={() => setShowLibrary((current) => !current)}>⌕ MIDIを探す</button><span className="local-dot">ブラウザで処理</span><button className="primary-button" disabled={!song || exporting} onClick={handleExport}>↗ 動画を保存</button><UserButton /></div>
+        <div className="top-actions"><button className="outline-button" onClick={() => setShowLibrary((current) => !current)}>⌕ MIDIを探す</button><span className="local-dot">ブラウザで処理</span><button className="primary-button" disabled={!song || exporting || audioLoading} onClick={handleExport}>{audioLoading ? "音源を準備中…" : exporting ? "リアルタイムで書き出し中…" : "↗ 動画を保存"}</button><UserButton /></div>
       </header>
       <main className="main">
         <div className="intro"><div><div className="eyebrow">MIDI → PIANO MOVIE</div><h1>音を、眺めよう。</h1><p>MIDIを読み込んで、自分だけのピアノ動画に。</p></div><span className="format-badge">ブラウザ完結 <span>•</span> Web Audio + Canvas</span></div>
@@ -425,15 +610,22 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
               <canvas ref={canvasRef} width={1920} height={1080} aria-label="落下するノートとピアノ鍵盤" />
               {!song && <div className="welcome"><div className="upload-icon">↥</div><h2>MIDIから、動き出す。</h2><p>ファイルをここにドラッグ＆ドロップ</p><button className="primary-button" onClick={() => fileRef.current?.click()}>MIDIファイルを選ぶ</button><button className="text-button" onClick={() => void loadSample()}>または、サンプルを試す →</button><small>.mid / .midi · 複数トラック対応</small></div>}
             </div>
-            <div className="transport"><div className="timeline"><span>{formatTime(position)}</span><input type="range" min="0" max={song?.duration ?? 1} step="0.01" value={position} disabled={!song} onChange={(event) => seek(Number(event.target.value))} /><span>{formatTime(song?.duration ?? 0)}</span></div><div className="transport-row"><div className="play-controls"><button className="icon-button" disabled={!song} onClick={() => seek(0)} aria-label="先頭へ">↶</button><button className="play-button" disabled={!song} onClick={togglePlayback} aria-label={playing ? "停止" : "再生"}>{playing ? "Ⅱ" : "▶"}</button><button className="outline-button" onClick={() => fileRef.current?.click()}>＋ MIDIを開く</button></div><div className="play-meta"><span>{activeTempo ? `${Math.round(activeTempo.bpm * settings.speed)} BPM` : "— BPM"}</span><span className="separator" /><span>{activeSignature ? `${activeSignature.numerator}/${activeSignature.denominator}` : "4/4"}</span><select aria-label="再生速度" value={settings.speed} onChange={(event) => updateSettings({ speed: Number(event.target.value) })}>{[.25, .5, .75, 1, 1.25, 1.5, 2].map((speed) => <option key={speed} value={speed}>{speed.toFixed(2)}×</option>)}</select><span className="separator" /><label className="transport-volume">VOL <input type="range" min="0" max="2" step=".05" value={settings.masterVolume} onChange={(event) => { const value = Number(event.target.value); updateSettings({ masterVolume: value }); if (masterGainRef.current) masterGainRef.current.gain.value = value; }} /><output>{Math.round(settings.masterVolume * 100)}%</output></label><button className="icon-button" onClick={() => setMuted((current) => !current)} aria-label="ミュート">{muted ? "×" : "♪"}</button></div></div></div>
+            <div className="transport"><div className="timeline"><span>{formatTime(position)}</span><input type="range" min="0" max={song?.duration ?? 1} step="0.01" value={position} disabled={!song || exporting} onChange={(event) => seek(Number(event.target.value))} /><span>{formatTime(song?.duration ?? 0)}</span></div><div className="transport-row"><div className="play-controls"><button className="icon-button" disabled={!song || exporting} onClick={() => seek(0)} aria-label="先頭へ">↶</button><button className="play-button" disabled={!song || audioLoading || exporting} onClick={() => void togglePlayback()} aria-label={audioLoading ? "音源読み込み中" : playing ? "停止" : "再生"}>{audioLoading ? "…" : playing ? "Ⅱ" : "▶"}</button><button className="outline-button" onClick={() => fileRef.current?.click()}>＋ MIDIを開く</button></div><div className="play-meta"><span>{activeTempo ? `${Math.round(activeTempo.bpm * settings.speed)} BPM` : "— BPM"}</span><span className="separator" /><span>{activeSignature ? `${activeSignature.numerator}/${activeSignature.denominator}` : "4/4"}</span><select aria-label="再生速度" value={settings.speed} onChange={(event) => updateSettings({ speed: Number(event.target.value) })}>{[.25, .5, .75, 1, 1.25, 1.5, 2].map((speed) => <option key={speed} value={speed}>{speed.toFixed(2)}×</option>)}</select><span className="separator" /><label className="transport-volume">VOL <input type="range" min="0" max="2" step=".05" value={settings.masterVolume} onChange={(event) => { const value = Number(event.target.value); updateSettings({ masterVolume: value }); if (masterGainRef.current) masterGainRef.current.gain.value = value; }} /><output>{Math.round(settings.masterVolume * 100)}%</output></label><button className="icon-button" onClick={() => setMuted((current) => !current)} aria-label="ミュート">{muted ? "×" : "♪"}</button></div></div></div>
             <div className="below-preview"><span><span className="status-dot" />Web Audioのブラウザピアノ</span><span>SPACE 再生 / 停止</span></div>
-            <div className="track-panel"><div className="section-head"><h2>トラック</h2><span className="track-count">{song ? `${song.tracks.length} TRACKS` : "0 TRACKS"}</span></div><div className="track-list">{song ? song.tracks.map((track) => { const trackVolume = settings.trackVolumes[String(track.id)] ?? 1; return <div className="track-row" key={track.id}><span className="track-color" style={{ background: settings.colors[`track:${track.id}`] || palette[track.id % palette.length] }} /><div><div className="track-name">{track.name}</div><div className="track-detail">{track.drums ? "Drums" : `CH ${track.channel + 1} · Program ${track.program + 1}`} · {track.count} notes</div></div><div className="track-controls"><label>表示 <input type="checkbox" checked={!hiddenTracks.has(track.id)} onChange={() => toggleTrack(track.id)} /></label><label>色 <input type="color" value={settings.colors[`track:${track.id}`] || palette[track.id % palette.length]} onChange={(event) => updateColor(`track:${track.id}`, event.target.value)} /></label></div><label className="track-volume"><span>音量 <output>{Math.round(trackVolume * 100)}%</output></span><input type="range" min="0" max="200" step="5" value={Math.round(trackVolume * 100)} aria-label={`${track.name}の音量`} onChange={(event) => updateSettings({ trackVolumes: { ...settings.trackVolumes, [String(track.id)]: Number(event.target.value) / 100 } })} /></label></div>; }) : <p className="empty">読み込んだMIDIのパートがここに表示されます。</p>}</div><p className="hint">トラックごとに表示・色・音量を調整できます。音量は再生と書き出し動画の両方に反映されます。</p></div>
+            <div className="track-panel"><div className="section-head"><h2>トラック</h2><span className="track-count">{song ? `${song.tracks.length} TRACKS` : "0 TRACKS"}</span></div><div className="track-list">{song ? song.tracks.map((track) => { const trackVolume = settings.trackVolumes[String(track.id)] ?? 1; const selectedInstrument = selectedSoundfont(track.id, song, settings); return <div className="track-row" key={track.id}><span className="track-color" style={{ background: settings.colors[`track:${track.id}`] || palette[track.id % palette.length] }} /><div><div className="track-name">{track.name}</div><div className="track-detail">{track.drums ? "Drums" : `CH ${track.channel + 1} · Program ${track.program + 1}`} · {track.count} notes</div></div><div className="track-controls"><label>表示 <input type="checkbox" checked={!hiddenTracks.has(track.id)} onChange={() => toggleTrack(track.id)} /></label><label>色 <input type="color" value={settings.colors[`track:${track.id}`] || palette[track.id % palette.length]} onChange={(event) => updateColor(`track:${track.id}`, event.target.value)} /></label></div><label className="track-instrument">音源 {loadingTrackInstrument === track.id && <span>読込中…</span>}<select aria-label={`${track.name}の音源`} value={selectedInstrument} disabled={audioLoading || loadingTrackInstrument !== null} onChange={(event) => void changeTrackSoundfont(track.id, event.target.value)}>{soundfontNames.map((instrument) => <option key={instrument} value={instrument}>{formatSoundfontName(instrument)}</option>)}</select></label><label className="track-volume"><span>音量 <output>{Math.round(trackVolume * 100)}%</output></span><input type="range" min="0" max="200" step="5" value={Math.round(trackVolume * 100)} aria-label={`${track.name}の音量`} onChange={(event) => updateSettings({ trackVolumes: { ...settings.trackVolumes, [String(track.id)]: Number(event.target.value) / 100 } })} /></label></div>; }) : <p className="empty">読み込んだMIDIのパートがここに表示されます。</p>}</div><p className="hint">トラックごとに音源・表示・色・音量を調整できます。「表示」をオフにしてもノートが描画されなくなるだけで音は鳴ります（消したい場合は音量を0%に）。音色サンプルは初回にネットから読み込みます。</p></div>
           </section>
           <aside className="settings"><div className="settings-title"><h2>スタジオ設定</h2><button className="text-button" onClick={() => { setSettings(defaults); setHiddenTracks(new Set()); }}>リセット</button></div>
             <details className="settings-section" open><summary><span><span className="eyebrow">01 / APPEARANCE</span><strong>映像</strong></span><span className="chevron">⌄</span></summary><div className="settings-body"><label className="setting-line">背景色 <input type="color" value={settings.background} onChange={(event) => updateSettings({ background: event.target.value })} /></label><label className="setting-line">ノートの色分け <select value={settings.colorMode} onChange={(event) => updateSettings({ colorMode: event.target.value as Settings["colorMode"] })}><option value="track">トラック別</option><option value="channel">チャンネル別</option></select></label><label className="setting-line">鍵盤の高さ <span className="range-output">{Math.round(settings.keyboardHeight * 100)}%</span></label><input type="range" min=".12" max=".4" step=".01" value={settings.keyboardHeight} onChange={(event) => updateSettings({ keyboardHeight: Number(event.target.value) })} /><label className="setting-line">落下の見通し <span className="range-output">{settings.fallSeconds.toFixed(1)} 秒</span></label><input type="range" min="1" max="10" step=".1" value={settings.fallSeconds} onChange={(event) => updateSettings({ fallSeconds: Number(event.target.value) })} /><label className="setting-line">最低音 <input type="number" min="0" max="126" value={settings.minPitch} onChange={(event) => updateSettings({ minPitch: Number(event.target.value) })} /></label><label className="setting-line">最高音 <input type="number" min="1" max="127" value={settings.maxPitch} onChange={(event) => updateSettings({ maxPitch: Number(event.target.value) })} /></label></div></details>
-            <details className="settings-section" open><summary><span><span className="eyebrow">02 / SCORE & CHORDS</span><strong>楽譜・推定コード</strong></span><span className="chevron">⌄</span></summary><div className="settings-body"><label className="setting-line">上部に楽譜を表示 <input type="checkbox" checked={settings.showScore} onChange={(event) => updateSettings({ showScore: event.target.checked })} /></label><label className="setting-line">同時に表示する小節数 <input type="number" min="1" max="8" value={settings.scoreMeasures} onChange={(event) => updateSettings({ scoreMeasures: Math.max(1, Math.min(8, Number(event.target.value))) })} /></label><label className="setting-line">左端に推定コードを表示 <input type="checkbox" checked={settings.showChords} onChange={(event) => updateSettings({ showChords: event.target.checked })} /></label><p className="hint">ブラウザ版では簡易スタッフ表示と、現在位置周辺の音から推定したコードを表示します。</p></div></details>
-            <details className="settings-section" open><summary><span><span className="eyebrow">03 / AUDIO</span><strong>ブラウザ音源</strong></span><span className="chevron">⌄</span></summary><div className="settings-body"><p className="hint">SoundFontやサーバーを使わず、Web Audio APIでピアノ風の音を合成します。読み込んだMIDIと設定は外部へ送信しません。</p><button className="outline-button full" onClick={() => { ensureAudio(); showNotice("ブラウザ音源を準備しました。"); }}>♪ 音源を準備</button></div></details>
-            <details className="settings-section" open><summary><span><span className="eyebrow">04 / EXPORT</span><strong>動画を書き出す</strong></span><span className="chevron">⌄</span></summary><div className="settings-body"><div className="export-spec"><strong>Canvas</strong><span>1920 × 1080 / 30 fps</span></div><button className="primary-button full" disabled={!song || exporting} onClick={handleExport}>{exporting ? "リアルタイムで書き出し中…" : "↗ 動画を保存"}</button><p className="hint">ブラウザの対応形式に応じてMP4またはWebMを、再生時間と同じ速度で保存します。</p></div></details>
+            <details className="settings-section" open><summary><span><span className="eyebrow">02 / SCORE & CHORDS</span><strong>楽譜・推定コード</strong></span><span className="chevron">⌄</span></summary><div className="settings-body">
+              <label className="setting-line">上部に楽譜を表示 <input type="checkbox" checked={settings.showScore} onChange={(event) => updateSettings({ showScore: event.target.checked })} /></label>
+              <label className="setting-line">譜面のトラック <select value={scoreTrack?.id ?? ""} disabled={!song} onChange={(event) => updateSettings({ scoreTrack: Number(event.target.value), scoreFormat: "auto" })}>{song?.tracks.filter((track) => track.count > 0).map((track) => <option key={track.id} value={track.id}>{track.name} {track.drums ? "(Drums)" : `(${track.id + 1})`}</option>)}</select></label>
+              <label className="setting-line">譜面形式 <select value={settings.scoreFormat} disabled={!scoreTrack} onChange={(event) => updateSettings({ scoreFormat: event.target.value as ScoreFormat })}><option value="auto">自動</option>{scoreTrack?.drums ? <option value="drums">ドラム譜</option> : <><option value="staff">五線譜</option><option value="tab">ギターTAB</option></>}</select></label>
+              <label className="setting-line">表示範囲（小節目安） <input type="number" min="1" max="8" value={settings.scoreMeasures} onChange={(event) => updateSettings({ scoreMeasures: Math.max(1, Math.min(8, Number(event.target.value) || 4)) })} /></label>
+              <label className="setting-line">左端に推定コードを表示 <input type="checkbox" checked={settings.showChords} onChange={(event) => updateSettings({ showChords: event.target.checked })} /></label>
+              <p className="hint">自動ではMIDIのギターパートにTAB、ドラムトラックにドラム譜を表示します。TABは標準チューニングの推定運指です。</p>
+            </div></details>
+            <details className="settings-section" open><summary><span><span className="eyebrow">03 / AUDIO</span><strong>ブラウザ音源</strong></span><span className="chevron">⌄</span></summary><div className="settings-body"><p className="hint">選択したGM音源のサンプルを必要時にブラウザへ読み込みます。MIDIファイルやノートデータは送信しません。初回の再生時は読み込みに少し時間がかかります。</p><button className="outline-button full" onClick={() => { ensureAudio(); showNotice("ブラウザ音源を準備しました。"); }}>♪ 音源を準備</button></div></details>
+            <details className="settings-section" open><summary><span><span className="eyebrow">04 / EXPORT</span><strong>動画を書き出す</strong></span><span className="chevron">⌄</span></summary><div className="settings-body"><div className="export-spec"><strong>Canvas</strong><span>1920 × 1080 / 30 fps</span></div><button className="primary-button full" disabled={!song || exporting || audioLoading} onClick={handleExport}>{exporting ? "リアルタイムで書き出し中…" : "↗ 動画を保存"}</button><p className="hint">ブラウザの対応形式に応じてMP4またはWebMを、再生時間と同じ速度で保存します。</p></div></details>
           </aside>
         </div>
         <footer><span>PIANO FALL <span className="muted">/</span> MIDI MOVIE STUDIO</span><span>Googleアカウント限定 · ブラウザ音源 · ローカル処理</span></footer>
@@ -442,6 +634,13 @@ export default function PianoFallStudio({ userName }: { userName: string }) {
       {notice && <div className={`notice${notice.error ? " error" : ""}`} role="status">{notice.text}</div>}
     </>
   );
+}
+
+function pickRecorderMimeType() {
+  if (typeof MediaRecorder === "undefined") throw new Error("このブラウザは動画保存に対応していません。");
+  // Avoid pinning an H.264 level: avc1.42E01E (Baseline 3.0) cannot encode 1920×1080 and some encoders fail silently.
+  const candidates = ["video/mp4;codecs=avc1.640028,mp4a.40.2", "video/mp4;codecs=avc1,mp4a.40.2", "video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm", "video/mp4"];
+  return candidates.find((type) => MediaRecorder.isTypeSupported(type));
 }
 
 function drawCanvas(canvas: HTMLCanvasElement, song: Song | null, settings: Settings, time: number, hiddenTracks: Set<number>) {
@@ -456,7 +655,7 @@ function drawCanvas(canvas: HTMLCanvasElement, song: Song | null, settings: Sett
   if (song) {
     song.beats.filter((beat) => beat.time >= time && beat.time <= time + settings.fallSeconds).forEach((beat) => { const y = line - (beat.time - time) * scale; ctx.strokeStyle = beat.strong ? "rgba(180,214,226,.15)" : "rgba(180,214,226,.06)"; ctx.lineWidth = beat.strong ? 2 : 1; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); });
     song.notes.filter((note) => !hiddenTracks.has(note.track) && note.pitch >= minPitch && note.pitch <= maxPitch && note.end >= time && note.start <= time + settings.fallSeconds).forEach((note) => { const key = keyPosition(note.pitch); const y0 = Math.max(top, line - (note.end - time) * scale); const y1 = Math.min(line, line - (note.start - time) * scale); if (y1 > y0) { ctx.fillStyle = noteColor(note); ctx.beginPath(); ctx.roundRect(key.x + 2, y0, key.width - 4, y1 - y0, 5); ctx.fill(); ctx.fillStyle = "rgba(255,255,255,.3)"; ctx.fillRect(key.x + 4, y0 + 2, 2, Math.max(0, y1 - y0 - 3)); } });
-    drawScore(ctx, song, settings, time, scoreHeight);
+    if (settings.showScore) drawScore(ctx, song, settings, time, scoreHeight);
   }
   const active = new Map<number, string>();
   song?.notes.filter((note) => !hiddenTracks.has(note.track) && note.start <= time && note.end > time).forEach((note) => active.set(note.pitch, noteColor(note)));
@@ -465,7 +664,76 @@ function drawCanvas(canvas: HTMLCanvasElement, song: Song | null, settings: Sett
 }
 
 function drawScore(ctx: CanvasRenderingContext2D, song: Song, settings: Settings, time: number, height: number) {
-  ctx.fillStyle = "rgba(8,16,21,.86)"; ctx.fillRect(0, 0, 1920, height); ctx.fillStyle = "#b9cfcd"; ctx.font = "20px sans-serif"; ctx.fillText("PIANO FALL · SIMPLE SCORE", 28, 27); if (settings.showChords) { ctx.fillStyle = "#77e4c8"; ctx.font = "24px sans-serif"; ctx.fillText(estimateChord(song, time), 28, 66); }
-  const left = 145, right = 1882, staffTop = 46, staffGap = 37; ctx.strokeStyle = "rgba(211,230,227,.55)"; ctx.lineWidth = 1; for (let staff = 0; staff < 2; staff += 1) for (let row = 0; row < 5; row += 1) { const y = staffTop + staff * staffGap + row * 8; ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke(); }
-  ctx.fillStyle = "#e6f0ee"; ctx.font = "32px serif"; ctx.fillText("𝄞", 104, 83); ctx.font = "26px serif"; ctx.fillText("𝄢", 105, 122); const windowStart = Math.max(0, Math.floor(time / 8) * 8); const notes = song.notes.filter((note) => note.start >= windowStart && note.start < windowStart + 8).slice(0, 100); notes.forEach((note) => { const x = left + ((note.start - windowStart) / 8) * (right - left); const staff = note.pitch >= 60 ? 0 : 1; const y = staffTop + staff * staffGap + (staff === 0 ? 32 - (note.pitch - 60) * 2.3 : 32 - (note.pitch - 36) * 2.3); ctx.fillStyle = palette[note.track % palette.length]; ctx.beginPath(); ctx.ellipse(x, y, 6, 4, -.25, 0, Math.PI * 2); ctx.fill(); ctx.fillRect(x + 5, y - 22, 2, 22); });
+  const track = selectedScoreTrack(song, settings);
+  const format = track ? resolveScoreFormat(settings.scoreFormat, track.drums, track.program) : "staff";
+  const tempo = song.tempos.findLast((entry) => entry.time <= time)?.bpm ?? 120;
+  const signature = song.signatures.findLast((entry) => entry.time <= time) ?? { numerator: 4, denominator: 4 };
+  const measureSeconds = 60 / tempo * signature.numerator * 4 / signature.denominator;
+  const windowSeconds = Math.max(.5, measureSeconds * settings.scoreMeasures);
+  const windowStart = Math.floor(time / windowSeconds) * windowSeconds;
+  const left = 165, right = 1880;
+  const xAt = (start: number) => left + (start - windowStart) / windowSeconds * (right - left);
+  const notes = song.notes.filter((note) => note.track === track?.id && note.start >= windowStart && note.start < windowStart + windowSeconds).slice(0, 800);
+  ctx.fillStyle = "#0d1b21"; ctx.fillRect(0, 0, 1920, height);
+  ctx.fillStyle = "#b9cfcd"; ctx.font = "20px sans-serif";
+  ctx.fillText(`${track?.name ?? "SCORE"} · ${format === "tab" ? "GUITAR TAB (EST.)" : format === "drums" ? "DRUM SCORE" : "SIMPLE SCORE"}`, 28, 27);
+  if (settings.showChords) { ctx.fillStyle = "#77e4c8"; ctx.font = "22px sans-serif"; ctx.fillText(estimateChord(song, time), 28, 148); }
+  ctx.strokeStyle = "rgba(211,230,227,.5)"; ctx.lineWidth = 1;
+  const line = (y: number) => { ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke(); };
+  if (format === "tab") {
+    for (let row = 0; row < 6; row += 1) {
+      const y = 50 + row * 14;
+      line(y);
+      ctx.fillStyle = "#b9cfcd"; ctx.font = "19px monospace"; ctx.fillText(GUITAR_STRING_LABELS[row], 135, y + 6);
+    }
+    const positions = tabForTrack(song, track!.id);
+    notes.forEach((note) => {
+      const x = xAt(note.start), position = positions.get(note.id);
+      if (!position) { ctx.fillStyle = "#ffbd78"; ctx.font = "16px sans-serif"; ctx.fillText("?", x - 4, 143); return; }
+      const y = 50 + position.string * 14;
+      const label = String(position.fret);
+      ctx.font = "bold 18px monospace";
+      const width = ctx.measureText(label).width + 7;
+      ctx.fillStyle = "#0d1b21"; ctx.fillRect(x - width / 2, y - 10, width, 19);
+      ctx.fillStyle = palette[note.track % palette.length]; ctx.fillText(label, x - (width - 7) / 2, y + 6);
+    });
+  } else if (format === "drums") {
+    const labels = ["CYM", "HH", "TOM", "SN", "KICK"];
+    for (let row = 0; row < 5; row += 1) {
+      const y = 53 + row * 17;
+      line(y);
+      ctx.fillStyle = "#b9cfcd"; ctx.font = "16px sans-serif"; ctx.fillText(labels[row], 108 - (row === 4 ? 8 : 0), y + 5);
+    }
+    notes.forEach((note) => {
+      const x = xAt(note.start), lane = drumLane(note.pitch), y = 53 + lane.row * 17;
+      ctx.strokeStyle = palette[note.track % palette.length]; ctx.fillStyle = ctx.strokeStyle; ctx.lineWidth = 3;
+      ctx.beginPath();
+      if (lane.head === "normal") { ctx.ellipse(x, y, 7, 5, -.25, 0, Math.PI * 2); ctx.fill(); }
+      else {
+        ctx.moveTo(x - 6, y - 6); ctx.lineTo(x + 6, y + 6); ctx.moveTo(x + 6, y - 6); ctx.lineTo(x - 6, y + 6); ctx.stroke();
+        if (lane.head === "open") { ctx.beginPath(); ctx.arc(x, y - 13, 4, 0, Math.PI * 2); ctx.stroke(); }
+      }
+    });
+  } else {
+    for (const top of [46, 91]) for (let row = 0; row < 5; row += 1) line(top + row * 8);
+    ctx.fillStyle = "#e6f0ee"; ctx.font = "32px serif"; ctx.fillText("𝄞", 125, 80); ctx.font = "26px serif"; ctx.fillText("𝄢", 126, 124);
+    const degree = [0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6];
+    notes.forEach((note) => {
+      const x = xAt(note.start), treble = note.pitch >= 60;
+      const diatonic = Math.floor(note.pitch / 12) * 7 + degree[note.pitch % 12];
+      const y = treble ? 78 - (diatonic - 30) * 4 : 123 - (diatonic - 18) * 4;
+      if (y < 38 || y > 136) return;
+      ctx.fillStyle = palette[note.track % palette.length];
+      ctx.beginPath(); ctx.ellipse(x, y, 7, 5, -.25, 0, Math.PI * 2); ctx.fill();
+      ctx.fillRect(x + 6, y - 23, 2, 23);
+      if ([1, 3, 6, 8, 10].includes(note.pitch % 12)) { ctx.font = "17px serif"; ctx.fillText("♯", x - 18, y + 5); }
+    });
+  }
+  ctx.strokeStyle = "rgba(211,230,227,.18)"; ctx.lineWidth = 1;
+  for (let measure = 1; measure < settings.scoreMeasures; measure += 1) {
+    const x = left + (right - left) * measure / settings.scoreMeasures;
+    ctx.beginPath(); ctx.moveTo(x, 42); ctx.lineTo(x, 129); ctx.stroke();
+  }
+  ctx.strokeStyle = "#77e4c8"; ctx.lineWidth = 2;
+  const cursor = xAt(time); ctx.beginPath(); ctx.moveTo(cursor, 39); ctx.lineTo(cursor, 132); ctx.stroke();
 }
